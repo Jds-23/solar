@@ -13,8 +13,16 @@ contract C {
     string immutable g;          //~ ERROR: immutable variables cannot have a non-value type
     bytes immutable h;           //~ ERROR: immutable variables cannot have a non-value type
 
+    // Immutable variables must be value types, but can be initialized normally
+    uint immutable x = 1;
+    address immutable y;
+
     struct S { uint x; }
     S immutable i;               //~ ERROR: immutable variables cannot have a non-value type
 
     mapping(uint => uint) immutable j;  //~ ERROR: immutable variables cannot have a non-value type
+
+    constructor() {
+        y = msg.sender;
+    }
 }

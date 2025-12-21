@@ -242,6 +242,50 @@ impl<'gcx> Ty<'gcx> {
         !(self.is_recursive() || self.has_mapping() || self.references_error())
     }
 
+    /// Validates if a reference type is valid for the given data location.
+    ///
+    /// Returns `Ok(())` if the type can be used at the location, or `Err(message)` with a
+    /// detailed error message explaining why it cannot be used.
+    ///
+    /// This is primarily used for validating reference types in calldata, memory, and storage.
+    pub fn valid_for_location(self, loc: DataLocation) -> Result<(), String> {
+        // For non-reference types, validation passes
+        if !self.is_reference_type() {
+            return Ok(());
+        }
+
+        match loc {
+            DataLocation::Storage => {
+                // Storage can hold any reference type, including those with mappings
+                Ok(())
+            }
+            DataLocation::Memory => {
+                // Memory cannot contain mappings or recursive types
+                if self.has_mapping() {
+                    Err("type is only valid in storage because it contains a (nested) mapping".to_string())
+                } else if self.is_recursive() {
+                    Err("type is only valid in storage because it is recursive".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            DataLocation::Calldata => {
+                // Calldata cannot contain mappings or recursive types
+                if self.has_mapping() {
+                    Err("type is only valid in storage because it contains a (nested) mapping".to_string())
+                } else if self.is_recursive() {
+                    Err("type is only valid in storage because it is recursive".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            DataLocation::Transient => {
+                // Transient storage has similar restrictions to storage
+                Ok(())
+            }
+        }
+    }
+
     /// Returns the parameter types of the type.
     #[inline]
     pub fn parameters(self) -> Option<&'gcx [Self]> {
@@ -529,6 +573,10 @@ impl<'gcx> Ty<'gcx> {
                     Result::Err(TyConvertError::NonDerivedContract)
                 }
             }
+
+            // Integer literals can be implicitly converted to integer types
+            (IntLiteral(false, _), Elementary(UInt(_))) => Ok(()),
+            (IntLiteral(true, _), Elementary(Int(_))) => Ok(()),
 
             // TODO: more implicit conversions
             _ => Result::Err(TyConvertError::Incompatible),

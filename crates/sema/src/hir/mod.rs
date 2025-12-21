@@ -1,6 +1,6 @@
 //! High-level intermediate representation (HIR).
 
-use crate::builtins::Builtin;
+use crate::{builtins::Builtin, ty::Gcx};
 use derive_more::derive::From;
 use either::Either;
 use rayon::prelude::*;
@@ -1064,6 +1064,31 @@ impl<'hir> Variable<'hir> {
     /// Returns `true` if the variable is public.
     pub fn is_public(&self) -> bool {
         self.visibility >= Some(Visibility::Public)
+    }
+
+    /// Returns `true` if the variable is a constructor parameter.
+    pub fn is_constructor_parameter(&self, gcx: Gcx<'_>) -> bool {
+        if self.kind != VarKind::FunctionParam {
+            return false;
+        }
+        self.function.is_some_and(|func_id| {
+            let func = gcx.hir.function(func_id);
+            func.is_constructor()
+        })
+    }
+
+    /// Returns `true` if the variable is a parameter in a library function.
+    pub fn is_library_function_parameter(&self, gcx: Gcx<'_>) -> bool {
+        if self.kind != VarKind::FunctionParam {
+            return false;
+        }
+        self.function.is_some_and(|func_id| {
+            let func = gcx.hir.function(func_id);
+            func.contract.is_some_and(|contract_id| {
+                let contract = gcx.hir.contract(contract_id);
+                contract.kind.is_library()
+            })
+        })
     }
 }
 

@@ -1,5 +1,6 @@
 use crate::{
     builtins::Builtin,
+    eval::ConstantEvaluator,
     hir::{self, Visit},
     ty::{Gcx, Ty, TyKind},
 };
@@ -18,6 +19,7 @@ struct TypeChecker<'gcx> {
     gcx: Gcx<'gcx>,
     source: hir::SourceId,
     contract: Option<hir::ContractId>,
+    function: Option<hir::FunctionId>,
 
     types: FxHashMap<hir::ExprId, Ty<'gcx>>,
 
@@ -37,7 +39,7 @@ enum NotLvalueReason {
 
 impl<'gcx> TypeChecker<'gcx> {
     fn new(gcx: Gcx<'gcx>, source: hir::SourceId) -> Self {
-        Self { gcx, source, contract: None, types: Default::default(), lvalue_context: None }
+        Self { gcx, source, contract: None, function: None, types: Default::default(), lvalue_context: None }
     }
 
     fn dcx(&self) -> &'gcx DiagCtxt {
@@ -46,6 +48,15 @@ impl<'gcx> TypeChecker<'gcx> {
 
     fn get(&self, expr: &'gcx hir::Expr<'gcx>) -> Ty<'gcx> {
         self.types[&expr.id]
+    }
+
+    /// Checks if an expression is a compile-time constant (can be evaluated statically).
+    ///
+    /// Returns `true` if the expression can be evaluated at compile time, `false` otherwise.
+    /// This includes literals, constant variables, and simple arithmetic operations.
+    fn is_compile_time_constant(&self, expr: &'gcx hir::Expr<'gcx>) -> bool {
+        let mut evaluator = ConstantEvaluator::new(self.gcx);
+        evaluator.try_eval(expr).is_ok()
     }
 
     #[must_use]
@@ -196,7 +207,7 @@ impl<'gcx> TypeChecker<'gcx> {
             }
             hir::ExprKind::Ident(res) => {
                 let res = self.resolve_overloads(res, expr.span);
-                if let Some(reason) = res_not_lvalue_reason(self.gcx, res) {
+                if let Some(reason) = self.res_not_lvalue_reason_in_context(res) {
                     self.try_set_not_lvalue(reason);
                 }
                 self.type_of_res(res)
@@ -323,7 +334,7 @@ impl<'gcx> TypeChecker<'gcx> {
                         if matches!(ty.kind, TyKind::Contract(_))
                             && possible_members.len() == 1
                             && possible_members[0].res.is_some_and(|res| {
-                                res_not_lvalue_reason(self.gcx, res).is_some()
+                                self.res_not_lvalue_reason_in_context(res).is_some()
                             }) =>
                     {
                         Some(NotLvalueReason::Generic)
@@ -589,6 +600,11 @@ impl<'gcx> TypeChecker<'gcx> {
         let _ = self.visit_ty(&var.ty);
         let ty = self.gcx.type_of_item(id.into());
 
+        // Early exit for struct members - they have different validation rules
+        if var.is_struct_member() {
+            return ty;
+        }
+
         // Immutable variables must be value types
         if var.is_immutable() && !ty.is_value_type() {
             self.dcx()
@@ -615,6 +631,41 @@ impl<'gcx> TypeChecker<'gcx> {
             self.dcx().err("library cannot have non-constant state variable").span(var.span).emit();
         }
 
+        // Constant variable validation
+        if var.is_constant() {
+            // Constants must be initialized
+            if var.initializer.is_none() {
+                self.dcx()
+                    .err("uninitialized \"constant\" variable")
+                    .span(var.span)
+                    .emit();
+            } else if let Some(init) = var.initializer {
+                // Constant initializers must be compile-time constants
+                if !self.is_compile_time_constant(init) {
+                    self.dcx()
+                        .err("initial value for constant variable has to be compile-time constant")
+                        .span(init.span)
+                        .emit();
+                }
+            }
+        }
+
+        // Non-state variables with mappings cannot be in calldata or memory
+        if !var.is_state_variable() {
+            if let Some(loc) = var.data_location {
+                if matches!(loc, DataLocation::Calldata | DataLocation::Memory) {
+                    if ty.has_mapping() {
+                        self.dcx()
+                            .err(format!(
+                                "type is only valid in storage because it contains a (nested) mapping"
+                            ))
+                            .span(var.span)
+                            .emit();
+                    }
+                }
+            }
+        }
+
         if let Some(init) = var.initializer {
             // TODO: might have different logic vs assignment
             self.check_assign(ty, init);
@@ -622,7 +673,59 @@ impl<'gcx> TypeChecker<'gcx> {
                 let _ = self.expect_ty(init, ty);
             }
         }
-        // TODO: checks from https://github.com/ethereum/solidity/blob/9d7cc42bc1c12bb43e9dccf8c6c36833fdfcbbca/libsolidity/analysis/TypeChecker.cpp#L472
+
+        // Reference type location validation
+        if ty.is_reference_type() {
+            if let Some(loc) = var.data_location {
+                // Determine if we should check calldata compatibility
+                let is_library_storage_param = var.is_library_function_parameter(self.gcx)
+                    && loc == DataLocation::Storage;
+
+                let is_abstract_constructor_param = var.is_constructor_parameter(self.gcx)
+                    && self.contract.is_some_and(|contract_id| {
+                        let contract = self.gcx.hir.contract(contract_id);
+                        contract.kind == solar_ast::ContractKind::AbstractContract
+                    });
+
+                let should_check_calldata =
+                    !is_abstract_constructor_param && (var.is_constructor_parameter(self.gcx)
+                        || (var.is_callable_or_catch_parameter() && var.is_public()))
+                        && !is_library_storage_param;
+
+                // Validate the type is valid for its location
+                if let Err(msg) = ty.valid_for_location(loc) {
+                    self.dcx()
+                        .err(format!("type {}", msg))
+                        .span(var.span)
+                        .emit();
+                }
+
+                // If needed, also check calldata compatibility
+                if should_check_calldata {
+                    if let Err(msg) = ty.valid_for_location(DataLocation::Calldata) {
+                        self.dcx()
+                            .err(format!("type {}", msg))
+                            .span(var.span)
+                            .emit();
+                    }
+                }
+            }
+        }
+
+        // Public state variable getter type validation
+        if var.is_state_variable() && var.is_public() {
+            if !ty.can_be_exported() {
+                self.dcx()
+                    .err("internal or recursive type is not allowed for public state variables")
+                    .span(var.span)
+                    .emit();
+            }
+        }
+
+        // TODO: Stack size check for immutable (requires Ty::stack_size() implementation)
+        // TODO: ABI coder V2 check for public getters (requires pragma tracking)
+        // TODO: Full interface type validation for getters
+
         ty
     }
 
@@ -767,6 +870,31 @@ impl<'gcx> TypeChecker<'gcx> {
         }
     }
 
+    fn res_not_lvalue_reason_in_context(&self, res: hir::Res) -> Option<NotLvalueReason> {
+        match res {
+            hir::Res::Item(hir::ItemId::Variable(var)) => {
+                let var = self.gcx.hir.variable(var);
+                match var.mutability {
+                    Some(m) if m.is_constant() => Some(NotLvalueReason::Constant),
+                    Some(m) if m.is_immutable() => {
+                        // Allow assignments to immutable variables in constructors
+                        if self.function.is_some_and(|fn_id| {
+                            let func = self.gcx.hir.function(fn_id);
+                            func.is_constructor()
+                        }) {
+                            None
+                        } else {
+                            Some(NotLvalueReason::Immutable)
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            hir::Res::Err(_) => None,
+            _ => Some(NotLvalueReason::Generic),
+        }
+    }
+
     fn register_ty(&mut self, expr: &'gcx hir::Expr<'gcx>, ty: Ty<'gcx>) {
         if let Some(prev_ty) = self.types.insert(expr.id, ty) {
             self.dcx()
@@ -837,6 +965,13 @@ impl<'gcx> hir::Visit<'gcx> for TypeChecker<'gcx> {
             }
         }
         self.walk_contract(contract)
+    }
+
+    fn visit_nested_function(&mut self, id: hir::FunctionId) -> ControlFlow<Self::BreakValue> {
+        let prev = self.function.replace(id);
+        let r = self.walk_nested_function(id);
+        self.function = prev;
+        r
     }
 
     fn visit_nested_var(&mut self, id: hir::VariableId) -> ControlFlow<Self::BreakValue> {
@@ -977,21 +1112,6 @@ impl<T> FromIterator<T> for WantOne<T> {
                 }
             }
         }
-    }
-}
-
-fn res_not_lvalue_reason(gcx: Gcx<'_>, res: hir::Res) -> Option<NotLvalueReason> {
-    match res {
-        hir::Res::Item(hir::ItemId::Variable(var)) => {
-            let var = gcx.hir.variable(var);
-            match var.mutability {
-                Some(m) if m.is_constant() => Some(NotLvalueReason::Constant),
-                Some(m) if m.is_immutable() => Some(NotLvalueReason::Immutable),
-                _ => None,
-            }
-        }
-        hir::Res::Err(_) => None,
-        _ => Some(NotLvalueReason::Generic),
     }
 }
 
